@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+set -e
+
+export SELF="$1"
+
+if [[ -z "${SELF}" ]]; then
+  echo "Usage: $0 <node> [commands...]" >&2
+  exit 1
+fi
+
+shift
+
+export CONTAINER_ID=$(grep cpu: /proc/self/cgroup | awk -F/ '{ print $3 }')
+
+confd -onetime -backend=env
+
+source /etc/profile
+
+if [[ -f "/stellar-core-override.cfg" ]]; then
+  CONFIG_OPTION="--conf /stellar-core-override.cfg"
+fi
+
+if [[ "$1" == "nopsql" ]]; then
+    shift
+else
+    while ! psql -c 'select 1' >/dev/null 2>&1; do
+        echo "Waiting for postgres to be available..."
+        sleep 1
+    done
+fi
+
+function newdb() {
+    # Create the Stellar DB if it doesnt exist, and flag stellar-core to initialise it
+    if [ "$( psql -tAc "SELECT 1 FROM pg_database WHERE datname='${STELLAR_DB}'" )" = '1' ]
+    then
+        echo "${STELLAR_DB} DB already exists"
+    else
+        echo "Initialising ${STELLAR_DB} DB"
+        dropdb $STELLAR_DB || true
+        createdb $STELLAR_DB || true
+        stellar-core $CONFIG_OPTION --newdb
+    fi
+
+    # Create the Horizon DB if it doesn't already exist
+    if [ "$( psql -tAc "SELECT 1 FROM pg_database WHERE datname='${HORIZON_DB}'" )" = '1' ]
+    then
+        echo "${HORIZON_DB} DB already exists"
+    else
+        echo "Initialising Horizon DB"
+        dropdb $HORIZON_DB || true
+        createdb $HORIZON_DB || true
+
+          if [[ -n "${HORIZON_PASSWORD}" ]]; then
+            dropuser horizon || true
+            createuser horizon || true
+            psql -c "alter user horizon with password '${HORIZON_PASSWORD}'"
+            psql >/dev/null <<-SQL
+              GRANT CONNECT ON DATABASE ${STELLAR_DB} to horizon;
+              \c ${STELLAR_DB}
+              REVOKE ALL ON schema public FROM public;
+              GRANT ALL ON schema public TO postgres;
+              GRANT USAGE ON SCHEMA public to horizon;
+
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO horizon;
+              GRANT SELECT ON ALL TABLES IN SCHEMA public TO horizon;
+
+              ALTER DEFAULT PRIVILEGES FOR USER postgres IN SCHEMA public GRANT SELECT ON SEQUENCES TO horizon;
+              ALTER DEFAULT PRIVILEGES FOR USER postgres IN SCHEMA public GRANT SELECT ON TABLES TO horizon;
+SQL
+      fi
+    fi
+}
+
+while [[ -n "$1" ]]; do
+  COMMAND="$1"
+  shift
+
+  case "${COMMAND}" in
+  newdb)
+    newdb
+    ;;
+  fresh)
+    newdb
+    [[ -n "${HISTORY_PUT}" ]] && stellar-core $CONFIG_OPTION --newhist "${SELF}" || true
+    ;;
+  newhist)
+    [[ -n "${HISTORY_PUT}" ]] && stellar-core $CONFIG_OPTION --newhist "${SELF}" || true
+    ;;
+  forcescp)
+    stellar-core $CONFIG_OPTION --forcescp
+    ;;
+  catchupcomplete)
+    stellar-core $CONFIG_OPTION --catchup-complete
+    ;;
+  catchuprange)
+    FROM=$1
+    shift
+    TO=$1
+    shift
+    if [ "${FROM}" -eq "${FROM}" -a "${TO}" -eq "${TO}" ]; then
+        OUTPUT=$1
+        if [[ "${OUTPUT}" ]]; then
+            stellar-core $CONFIG_OPTION --catchup-at $FROM --catchup-to $TO --output-file "${OUTPUT}"
+            shift
+        else
+            stellar-core $CONFIG_OPTION --catchup-at $FROM --catchup-to $TO
+        fi
+    else
+      echo "Valid ledger range required" >&2
+      exit 1
+    fi
+    ;;
+  lasthistorycheckpoint)
+    OUTPUT=$1
+    if [[ "${OUTPUT}" ]]; then
+        stellar-core $CONFIG_OPTION --report-last-history-checkpoint --output-file "${OUTPUT}"
+        shift
+    else
+        stellar-core $CONFIG_OPTION --report-last-history-checkpoint
+    fi
+    SKIP_START=true
+    ;;
+  skipstart)
+    SKIP_START=true
+    ;;
+  *)
+    echo "Unknown container command $COMMAND" >&2
+    exit 1
+  esac
+done
+
+if [[ -z "${SKIP_START}" ]]; then
+  exec /init -- stellar-core $CONFIG_OPTION
+else
+  echo "Setup complete. Skipping server start."
+fi
